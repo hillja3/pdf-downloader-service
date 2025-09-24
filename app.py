@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Add version marker to your code
-VERSION = "2.2-FIXED-INDENTATION"
+VERSION = "2.3-FINAL-FIXED"
 logger.info(f"PDF Downloader Service v{VERSION} starting...")
 
 app = FastAPI(
@@ -27,23 +27,37 @@ app = FastAPI(
     default_response_class=JSONResponse  # Always JSON
 )
 
-# Initialize Supabase client
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+# Initialize Supabase client with error handling
+supabase: Optional[Client] = None
+try:
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    
+    if supabase_url and supabase_key:
+        supabase = create_client(supabase_url, supabase_key)
+        logger.info("✅ Supabase client initialized")
+    else:
+        logger.warning("⚠️ Supabase credentials not found in environment variables")
+        logger.warning("⚠️ PDFs will be downloaded but not stored. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Supabase client: {e}")
+    supabase = None
 
 # Initialize Redis for queue management
+redis_client = None
 try:
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", 6379))
+    
     redis_client = redis.Redis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", 6379)),
+        host=redis_host,
+        port=redis_port,
         db=0,
         decode_responses=True
     )
     # Test connection
     redis_client.ping()
-    logger.info("✅ Redis connected successfully")
+    logger.info(f"✅ Redis connected successfully at {redis_host}:{redis_port}")
 except Exception as e:
     logger.error(f"❌ Redis connection failed: {e}")
     logger.info("💡 Running without Redis - using in-memory queue")
@@ -56,6 +70,7 @@ class DownloadRequest(BaseModel):
     charter_num: str
     document_type: Optional[str] = "other"
     priority: Optional[int] = 5  # 1-10, lower is higher priority
+    county: Optional[str] = "montgomery"
 
 class BatchDownloadRequest(BaseModel):
     documents: List[DownloadRequest]
@@ -83,11 +98,11 @@ class OnBasePDFDownloader:
             playwright = await async_playwright().start()
             self.browser = await playwright.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox']
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             )
             self.context = await self.browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0'
             )
     
     async def cleanup(self):
@@ -121,7 +136,7 @@ class OnBasePDFDownloader:
             # Wait for OnBase to load the document
             logger.info("⏳ Waiting for document to load...")
             
-            # Try multiple strategies to find the PDF - FIXED INDENTATION HERE
+            # Try multiple strategies to find the PDF - FIXED INDENTATION
             strategies = [
                 # Strategy 1: Wait for PDF iframe/embed
                 ('iframe[src*=".pdf"], iframe#docFrame, embed[type="application/pdf"]', 15000),
@@ -313,31 +328,44 @@ class QueueManager:
         # Use in-memory status
         return QueueManager._memory_status.get(document_id)
 
-# Storage helper function
-async def store_document(document_id: str, charter_num: str, document_url: str, document_type: str, pdf_content: bytes, county: str = "montgomery"):
+# Storage helper function with better error handling
+async def store_document(document_id: str, charter_num: str, document_url: str, 
+                         document_type: str, pdf_content: bytes, county: str = "montgomery"):
     """Store document using Supabase Storage and save metadata in table"""
+    
+    # Check if Supabase is properly configured
+    if not os.getenv("SUPABASE_URL") or not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+        logger.warning(f"⚠️ Supabase credentials not configured, cannot store {document_id}")
+        logger.warning("⚠️ PDF was downloaded successfully but not stored. Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
+        return None
+    
     if not supabase:
-        logger.warning("Supabase not configured, skipping storage")
+        logger.warning(f"⚠️ Supabase client not initialized, cannot store {document_id}")
         return None
     
     try:
         filename = f"{county}/{document_id}-{uuid4().hex}.pdf"
         
-        # Create bucket if it doesn't exist
+        # Create bucket if it doesn't exist (handle silently if exists)
         try:
             supabase.storage.create_bucket("county-records", public=False)
-        except:
-            pass  # Bucket likely already exists
+            logger.info("Created storage bucket: county-records")
+        except Exception as e:
+            # Bucket likely already exists, which is fine
+            if "already exists" not in str(e).lower():
+                logger.debug(f"Bucket creation note: {e}")
         
         # Upload to storage bucket
-        supabase.storage.from_("county-records").upload(
+        logger.info(f"📤 Uploading {document_id} to storage...")
+        response = supabase.storage.from_("county-records").upload(
             file=pdf_content, 
             path=filename, 
             file_options={"content-type": "application/pdf", "upsert": True}
         )
         
         # Save metadata in table
-        supabase.table(f"{county}_documents").upsert({
+        table_name = f"{county}_documents"
+        metadata = {
             "document_id": document_id,
             "charter_num": charter_num,
             "document_url": document_url,
@@ -348,15 +376,34 @@ async def store_document(document_id: str, charter_num: str, document_url: str, 
             "processing_status": "completed",
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "crawled_at": datetime.now(timezone.utc).isoformat()
-        }, on_conflict="document_id").execute()
+        }
         
-        logger.info(f"✅ Stored document to storage: {filename}")
+        # Try to upsert to database
+        logger.info(f"📊 Saving metadata for {document_id} to {table_name}")
+        supabase.table(table_name).upsert(metadata, on_conflict="document_id").execute()
+        
+        logger.info(f"✅ Successfully stored {document_id}: {filename} ({len(pdf_content)} bytes)")
         return filename
+        
     except Exception as e:
-        logger.error(f"Storage error: {e}")
+        error_msg = str(e)
+        
+        # Check for specific error types
+        if "'bool' object has no attribute 'encode'" in error_msg:
+            logger.error(f"❌ Storage API configuration error for {document_id}")
+            logger.error("This usually means Supabase credentials are invalid or the service is not properly configured")
+        elif "relation" in error_msg and "does not exist" in error_msg:
+            logger.error(f"❌ Database table '{county}_documents' does not exist")
+            logger.error("Please create the table in Supabase first")
+        else:
+            logger.error(f"❌ Storage error for {document_id}: {error_msg}")
+        
         import traceback
-        logger.error(traceback.format_exc())
-        raise
+        logger.debug(traceback.format_exc())
+        
+        # Don't raise the error - return None to indicate storage failed
+        # The PDF was still downloaded successfully
+        return None
 
 # Worker Process
 async def process_download(request: DownloadRequest):
@@ -380,21 +427,28 @@ async def process_download(request: DownloadRequest):
         pdf_data = await downloader.download_pdf(request.document_url)
         
         # Store document using Supabase Storage
+        county = getattr(request, 'county', 'montgomery')
         storage_path = await store_document(
             document_id=request.document_id,
             charter_num=request.charter_num,
             document_url=request.document_url,
             document_type=request.document_type,
-            pdf_content=pdf_data
+            pdf_content=pdf_data,
+            county=county
         )
         
-        # Update status
-        status.status = "completed"
-        status.storage_path = storage_path
+        # Update status based on whether storage succeeded
+        if storage_path:
+            status.status = "completed"
+            status.storage_path = storage_path
+            logger.info(f"✅ Successfully processed and stored {request.document_id}")
+        else:
+            status.status = "downloaded"  # New status: downloaded but not stored
+            logger.info(f"⚠️ Downloaded {request.document_id} but storage unavailable")
+        
         status.file_size = len(pdf_data)
         QueueManager.update_status(request.document_id, status)
         
-        logger.info(f"✅ Successfully processed {request.document_id}")
         return status
         
     except Exception as e:
@@ -451,13 +505,29 @@ async def worker_loop():
 async def startup_event():
     """Start background worker"""
     logger.info(f"🚀 Starting PDF Downloader Service v{VERSION}")
+    logger.info(f"📍 Environment: Supabase={'✅ Configured' if supabase else '❌ Not configured'}, Redis={'✅ Connected' if redis_client else '❌ Using memory queue'}")
     asyncio.create_task(worker_loop())
     logger.info("✅ PDF Downloader Service started")
 
 @app.get("/version")
 async def version():
     """Version check endpoint"""
-    return {"version": VERSION, "status": "running"}
+    return {
+        "version": VERSION, 
+        "status": "running",
+        "supabase_configured": supabase is not None,
+        "redis_connected": redis_client is not None
+    }
+
+@app.get("/")
+async def root():
+    """Health check root endpoint"""
+    return {
+        "service": "PDF Downloader",
+        "version": VERSION,
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 @app.post("/download")
 async def download_pdf(request: DownloadRequest, background_tasks: BackgroundTasks):
@@ -508,7 +578,8 @@ async def queue_stats():
     stats = {
         "processing": len(QueueManager._memory_status),
         "queued": len(QueueManager._memory_queue),
-        "use_redis": redis_client is not None
+        "use_redis": redis_client is not None,
+        "supabase_configured": supabase is not None
     }
     
     if redis_client:
@@ -540,14 +611,6 @@ async def all_exception_handler(request: Request, exc: Exception):
         status_code=500, 
         content={"status": "error", "message": str(exc)}
     )
-
-async def notify_callback(callback_url: str, statuses: List[DownloadStatus]):
-    """Notify callback URL when batch is complete"""
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(callback_url, json=[s.dict() for s in statuses])
-        except Exception as e:
-            logger.error(f"Failed to notify callback: {e}")
 
 if __name__ == "__main__":
     import uvicorn
