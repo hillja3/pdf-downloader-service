@@ -81,6 +81,25 @@ async def init_browser():
             java_script_enabled=True,
             accept_downloads=True
         )
+        
+        # Add context-level listeners for popups and new tabs
+        async def context_response_handler(response):
+            try:
+                url = response.url
+                url_lower = url.lower()
+                
+                # Check for PrintHandler PDFs that might open in new tabs
+                if 'printhandler.ashx' in url_lower:
+                    body = await response.body()
+                    if body and body[:5] == b'%PDF-':
+                        logger.info(f"🎯 [Context] Caught PrintHandler PDF: {url}")
+                        # Store in global or handle appropriately
+            except:
+                pass
+        
+        BROWSER_CONTEXT.on('response', lambda resp: asyncio.create_task(context_response_handler(resp)))
+        BROWSER_CONTEXT.on('page', lambda p: logger.debug(f"[Context] New page opened: {p.url}"))
+        
         logger.info("✅ Browser initialized for OnBase")
 
 async def debug_page_content(page):
@@ -357,42 +376,173 @@ async def download_image_from_page(page, src: str) -> bytes:
     return None
 
 async def download_pdf_onbase(url: str) -> bytes:
-    """Enhanced OnBase PDF downloader with multi-page support"""
+    """Enhanced OnBase PDF downloader - implements ChatGPT's targeted patches"""
     logger.info(f"📄 Starting OnBase download for URL: {url}")
     
     if not BROWSER_CONTEXT:
         await init_browser()
     
     page = await BROWSER_CONTEXT.new_page()
-    
-    page.on('console', lambda msg: logger.debug(f"Browser console: {msg.text}"))
-    page.on('pageerror', lambda err: logger.error(f"Browser error: {err}"))
+    pdf_data = None
+    captured_images = []
     
     try:
-        pdf_data = None
-        
+        # A) Enhanced response handler per ChatGPT's patch
         async def handle_response(response):
-            nonlocal pdf_data
+            nonlocal pdf_data, captured_images
             try:
-                content_type = response.headers.get('content-type', '').lower()
-                url_lower = response.url.lower()
+                url = response.url
+                url_lower = url.lower()
+                ctype = (response.headers.get('content-type') or '').lower()
                 
-                logger.debug(f"Response: {response.status} {response.url[:100]} [{content_type}]")
+                logger.debug(f"Response: {response.status} {url[:120]} [{ctype}]")
                 
-                if 'application/pdf' in content_type or url_lower.endswith('.pdf'):
-                    logger.info(f"🎯 Intercepted PDF response: {response.url}")
+                # 1) Direct PDF by content-type or extension
+                if 'application/pdf' in ctype or url_lower.endswith('.pdf'):
+                    logger.info(f"🎯 Intercepted PDF (ctype/ext): {url}")
                     pdf_data = await response.body()
+                    return
+                
+                # 2) OnBase print/export endpoints that often serve PDFs as octet-stream
+                if ('printhandler.ashx' in url_lower or
+                    'getdocument.ashx' in url_lower or
+                    'getpdf.ashx' in url_lower):
+                    # Don't trust content-type; try to read it anyway
+                    body = await response.body()
+                    # Very cheap sniff: PDFs start with %PDF-
+                    if body and body[:5] == b'%PDF-':
+                        logger.info(f"🎯 Intercepted OnBase print/export PDF: {url}")
+                        pdf_data = body
+                        return
+                
+                # 3) Capture ImageProvider pages
+                if 'imageprovider.ashx' in url_lower and ('getpage' in url_lower or 'page=' in url_lower):
+                    if 'image' in ctype:
+                        body = await response.body()
+                        if body and len(body) > 1000:
+                            logger.info(f"📸 Captured page image: {url}")
+                            captured_images.append(body)
+                            
             except Exception as e:
                 logger.debug(f"Response handler error: {e}")
         
         page.on('response', handle_response)
         
-        logger.info(f"📄 Navigating to OnBase URL: {url}")
+        # C) Check for popup viewer per ChatGPT
+        popup_task = asyncio.create_task(page.wait_for_event("popup", timeout=5000))
         
-        response = await page.goto(url, wait_until='networkidle', timeout=60000)
-        logger.info(f"Navigation complete: {response.status if response else 'No response'}")
+        logger.info(f"Navigating to: {url}")
+        await page.goto(url, wait_until='domcontentloaded', timeout=60000)
         
-        await page.wait_for_timeout(5000)
+        # Check if a popup opened
+        try:
+            new_page = await asyncio.wait_for(popup_task, timeout=5)
+            logger.info(f"🔀 Switched to viewer popup: {new_page.url}")
+            page = new_page  # switch to the viewer tab
+            page.on('response', handle_response)  # Add handler to popup too
+        except asyncio.TimeoutError:
+            logger.debug("No popup detected; continuing on current page.")
+        
+        # D) Explicit wait for ImageProvider/PrintHandler per ChatGPT
+        try:
+            await page.wait_for_event("response", timeout=8000, predicate=lambda r:
+                ("imageprovider.ashx" in r.url.lower() and "getpage" in r.url.lower()) or
+                ("printhandler.ashx" in r.url.lower())
+            )
+            logger.info("✅ OnBase document responses detected")
+        except Exception:
+            logger.debug("No ImageProvider/PrintHandler response observed within 8s.")
+        
+        # Try clicking the print button to trigger PrintHandler
+        await page.wait_for_timeout(2000)
+        try:
+            print_selectors = [
+                'img[alt*="Print"]',
+                'img[title*="Print"]', 
+                'button[title*="Print"]',
+                'a[title*="Print"]',
+                '[onclick*="print"]'
+            ]
+            for selector in print_selectors:
+                print_btn = await page.query_selector(selector)
+                if print_btn:
+                    logger.info(f"📄 Found print button ({selector}), clicking...")
+                    await print_btn.click()
+                    # Wait for PrintHandler response
+                    await page.wait_for_timeout(3000)
+                    break
+        except Exception as e:
+            logger.debug(f"Print button attempt: {e}")
+        
+        # Check if we got the PDF
+        if pdf_data and len(pdf_data) > 10000:
+            logger.info(f"✅ Got PDF directly: {len(pdf_data)} bytes")
+            return pdf_data
+        
+        # If we captured page images, combine them
+        if captured_images:
+            logger.info(f"Combining {len(captured_images)} page images into PDF...")
+            return combine_images_to_pdf(captured_images)
+        
+        # Fallback: Look for images in frames
+        logger.warning("No direct PDF/images, checking frames...")
+        for frame in page.frames:
+            if 'viewdocument' in frame.url.lower():
+                images = await frame.query_selector_all('img[src*="ImageProvider"]')
+                for img in images:
+                    src = await img.get_attribute('src')
+                    if src:
+                        img_data = await download_image_from_page(frame, src)
+                        if img_data:
+                            captured_images.append(img_data)
+        
+        if captured_images:
+            return combine_images_to_pdf(captured_images)
+        
+        # Last resort
+        logger.error("All methods failed, taking screenshot")
+        screenshot = await page.screenshot(full_page=True)
+        return convert_screenshot_to_pdf(screenshot)
+def combine_images_to_pdf(images: List[bytes]) -> bytes:
+    """Combine multiple image bytes into a PDF"""
+    from PIL import Image
+    import io
+    
+    pil_images = []
+    for img_bytes in images:
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            pil_images.append(img)
+        except:
+            pass
+    
+    if pil_images:
+        pdf_buffer = io.BytesIO()
+        pil_images[0].save(
+            pdf_buffer, 'PDF',
+            save_all=True,
+            append_images=pil_images[1:] if len(pil_images) > 1 else [],
+            resolution=100.0
+        )
+        pdf_buffer.seek(0)
+        return pdf_buffer.read()
+    return b''
+
+def convert_screenshot_to_pdf(screenshot: bytes) -> bytes:
+    """Convert a screenshot to PDF"""
+    from PIL import Image
+    import io
+    
+    img = Image.open(io.BytesIO(screenshot))
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    pdf_buffer = io.BytesIO()
+    img.save(pdf_buffer, 'PDF')
+    pdf_buffer.seek(0)
+    return pdf_buffer.read()
         
         if pdf_data and len(pdf_data) > 10000:
             logger.info("✅ Got direct PDF from response")
