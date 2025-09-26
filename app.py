@@ -503,6 +503,12 @@ async def download_pdf_onbase(url: str) -> bytes:
         logger.error("All methods failed, taking screenshot")
         screenshot = await page.screenshot(full_page=True)
         return convert_screenshot_to_pdf(screenshot)
+        
+    except Exception as e:
+        logger.error(f"OnBase download error: {e}", exc_info=True)
+        raise
+    finally:
+        await page.close()
 def combine_images_to_pdf(images: List[bytes]) -> bytes:
     """Combine multiple image bytes into a PDF"""
     from PIL import Image
